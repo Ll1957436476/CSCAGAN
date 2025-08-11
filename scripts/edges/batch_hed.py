@@ -8,7 +8,10 @@
 # For large images, it will produce gpu memory issue. Therefore, you better resize the images before running this script. 
 # Step 5: run the MATLAB post-processing script "PostprocessHED.m" 
 import numpy as np
-import scipy.misc
+try:
+    import scipy.misc
+except ImportError:
+    scipy = None
 from PIL import Image
 import scipy.io
 import os

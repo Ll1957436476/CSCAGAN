@@ -1,10 +1,12 @@
 import time
+import torch
 from options.train_options import TrainOptions
 from data import CreateDataLoader
 from models import create_model
 from util.visualizer import Visualizer
 
 if __name__ == '__main__':
+    torch.backends.cudnn.benchmark = True
     opt = TrainOptions().parse()
     data_loader = CreateDataLoader(opt)
     dataset = data_loader.load_data()
@@ -37,6 +39,15 @@ if __name__ == '__main__':
 
             if total_steps % opt.print_freq == 0:
                 losses = model.get_current_losses()
+
+                # 显示CSCA损失的精确值
+                if 'csca_reg' in losses:
+                    csca_value = losses['csca_reg']
+                    if csca_value != 0:
+                        print(f"csca_reg_precise: {csca_value:.8f}", flush=True)
+                    else:
+                        print("csca_reg_precise: 0.00000000 (检查CSCA模块是否正常工作)", flush=True)
+
                 t = (time.time() - iter_start_time) / opt.batch_size
                 visualizer.print_current_losses(epoch, epoch_iter, losses, t, t_data)
                 if opt.display_id > 0:

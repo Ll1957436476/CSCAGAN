@@ -1,0 +1,28 @@
+# Datasets and Models (very large files)
+checkpoints/
+results/
+datasets/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE and editor files
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Log files
+*.log
+loss_log.txt
+
+# OS-generated files
+.DS_Store
+Thumbs.db

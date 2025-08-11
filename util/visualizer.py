@@ -5,7 +5,40 @@ import ntpath
 import time
 from . import util
 from . import html
-from scipy.misc import imresize
+try:
+    from scipy.misc import imresize
+except ImportError:
+    from PIL import Image
+    import numpy as np
+    def imresize(arr, size):
+        """替代scipy.misc.imresize的函数"""
+        if isinstance(arr, np.ndarray):
+            # 将numpy数组转换为PIL图像
+            if arr.dtype != np.uint8:
+                arr = (arr * 255).astype(np.uint8)
+            if len(arr.shape) == 3:
+                img = Image.fromarray(arr)
+            else:
+                img = Image.fromarray(arr, mode='L')
+        else:
+            img = arr
+
+        # 调整大小
+        if isinstance(size, (list, tuple)) and len(size) == 2:
+            resized_img = img.resize((size[1], size[0]), Image.LANCZOS)
+        else:
+            # 如果size是单个数字，按比例缩放
+            w, h = img.size
+            if w > h:
+                new_w = size
+                new_h = int(h * size / w)
+            else:
+                new_h = size
+                new_w = int(w * size / h)
+            resized_img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # 转换回numpy数组
+        return np.array(resized_img)
 
 if sys.version_info[0] == 2:
     VisdomExceptionBase = Exception

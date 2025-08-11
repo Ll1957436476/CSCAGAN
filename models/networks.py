@@ -71,14 +71,24 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[],
+             csca_config=None, training_stage='full'):
+    """
+    定义CSCA增强的生成器网络
+
+    Args:
+        csca_config: CSCA配置对象
+        training_stage: CSCA训练阶段
+    """
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
 
     if netG == 'resnet_9blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9,
+                             csca_config=csca_config, training_stage=training_stage)
     elif netG == 'resnet_6blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6,
+                             csca_config=csca_config, training_stage=training_stage)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -173,23 +183,49 @@ class GradPenalty(nn.Module):
 # Code and idea originally from Justin Johnson's architecture.
 # https://github.com/jcjohnson/fast-neural-style/
 class ResnetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect'):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect',
+                 csca_config=None, training_stage='full'):
+        """
+        CSCA增强的ResNet生成器
+
+        Args:
+            input_nc: 输入通道数
+            output_nc: 输出通道数
+            ngf: 生成器特征数
+            norm_layer: 归一化层
+            use_dropout: 是否使用dropout
+            n_blocks: ResNet块数量
+            padding_type: 填充类型
+            csca_config: CSCA配置对象
+            training_stage: CSCA训练阶段
+        """
         assert(n_blocks >= 0)
         super(ResnetGenerator, self).__init__()
         self.input_nc = input_nc
         self.output_nc = output_nc
         self.ngf = ngf
+        self.n_blocks = n_blocks
+        self.training_stage = training_stage
+
+        # 导入CSCA配置
+        if csca_config is None:
+            from .CSCA import CSCAConfig
+            csca_config = CSCAConfig()
+        self.csca_config = csca_config
+
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
 
+        # 构建模型层
         model = [nn.ReflectionPad2d(3),
                  nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0,
                            bias=use_bias),
                  norm_layer(ngf),
                  nn.ReLU(True)]
 
+        # 下采样层
         n_downsampling = 2
         for i in range(n_downsampling):
             mult = 2**i
@@ -198,10 +234,21 @@ class ResnetGenerator(nn.Module):
                       norm_layer(ngf * mult * 2),
                       nn.ReLU(True)]
 
+        # CSCA增强的ResNet块
         mult = 2**n_downsampling
+        self.resnet_blocks = nn.ModuleList()
         for i in range(n_blocks):
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+            block = ResnetBlock(ngf * mult,
+                              padding_type=padding_type,
+                              norm_layer=norm_layer,
+                              use_dropout=use_dropout,
+                              use_bias=use_bias,
+                              csca_config=self.csca_config,
+                              training_stage=training_stage)
+            self.resnet_blocks.append(block)
+            model.append(block)
 
+        # 上采样层
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
             model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
@@ -210,6 +257,8 @@ class ResnetGenerator(nn.Module):
                                          bias=use_bias),
                       norm_layer(int(ngf * mult / 2)),
                       nn.ReLU(True)]
+
+        # 输出层
         model += [nn.ReflectionPad2d(3)]
         model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
         model += [nn.Tanh()]
@@ -219,48 +268,170 @@ class ResnetGenerator(nn.Module):
     def forward(self, input):
         return self.model(input)
 
+    def set_csca_training_stage(self, stage):
+        """设置所有ResNet块的CSCA训练阶段"""
+        self.training_stage = stage
+        for block in self.resnet_blocks:
+            block.set_training_stage(stage)
 
-# Define a resnet block
+    def get_csca_losses(self):
+        """获取所有CSCA块的正则化损失"""
+        total_loss = 0.0
+        for block in self.resnet_blocks:
+            total_loss += block.get_csca_losses()
+        return total_loss
+
+
+# Define a resnet block with integrated CSCA attention
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias,
+                 csca_config=None, training_stage='full'):
+        """
+        CSCA增强的ResNet块
+
+        Args:
+            dim: 特征维度
+            padding_type: 填充类型
+            norm_layer: 归一化层
+            use_dropout: 是否使用dropout
+            use_bias: 是否使用bias
+            csca_config: CSCA配置对象
+            training_stage: CSCA训练阶段 ('mid_only', 'final_only', 'full')
+        """
         super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.training_stage = training_stage
 
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        conv_block = []
+        # 导入CSCA模块
+        from .CSCA import MidAttentionModule, FinalAttentionModule, CSCAConfig
+
+        # 使用默认配置或传入的配置
+        if csca_config is None:
+            csca_config = CSCAConfig()
+        self.csca_config = csca_config
+
+        # 构建分离的卷积层（便于插入注意力）
+        self.conv1_block, self.conv2_block = self.build_conv_blocks(
+            dim, padding_type, norm_layer, use_dropout, use_bias
+        )
+
+        # 集成CSCA注意力模块
+        self.mid_attention = MidAttentionModule(
+            dim,
+            init_gate=csca_config.mid_init_gate,
+            l1_weight=csca_config.l1_weight
+        )
+
+        self.final_attention = FinalAttentionModule(
+            dim,
+            init_gate=csca_config.final_init_gate,
+            reduction=csca_config.reduction,
+            l1_weight=csca_config.l1_weight,
+            config=csca_config # Pass the whole config
+        )
+
+        self.res_scale = nn.Parameter(torch.tensor(1.0)) # Bugfix #7: 修正缺失的残差缩放参数
+
+        # 调试信息：确认CSCA模块正常启用 (已注释，需要时可取消注释)
+        # print(f"创建ResNet块，CSCA配置: {csca_config}, 训练阶段: {training_stage}")
+        # print(f"CSCA模块已启用 - 中间注意力: {csca_config.mid_init_gate}, 最终注意力: {csca_config.final_init_gate}")
+
+    def build_conv_blocks(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+        """
+        构建分离的卷积块，便于插入CSCA注意力
+
+        Returns:
+            tuple: (conv1_block, conv2_block)
+        """
+        # 第一个卷积块: Pad -> Conv -> Norm -> ReLU -> (Dropout?)
+        conv1_layers = []
         p = 0
         if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
+            conv1_layers += [nn.ReflectionPad2d(1)]
         elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
+            conv1_layers += [nn.ReplicationPad2d(1)]
         elif padding_type == 'zero':
             p = 1
         else:
             raise NotImplementedError('padding [%s] is not implemented' % padding_type)
 
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
-                       norm_layer(dim),
-                       nn.ReLU(True)]
+        conv1_layers += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
+                        norm_layer(dim),
+                        nn.ReLU(True)]
         if use_dropout:
-            conv_block += [nn.Dropout(0.5)]
+            conv1_layers += [nn.Dropout(0.5)]
 
+        # 第二个卷积块: Pad -> Conv -> Norm (注意：没有ReLU)
+        conv2_layers = []
         p = 0
         if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
+            conv2_layers += [nn.ReflectionPad2d(1)]
         elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
+            conv2_layers += [nn.ReplicationPad2d(1)]
         elif padding_type == 'zero':
             p = 1
         else:
             raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
-                       norm_layer(dim)]
 
-        return nn.Sequential(*conv_block)
+        conv2_layers += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
+                        norm_layer(dim)]
+
+        return nn.Sequential(*conv1_layers), nn.Sequential(*conv2_layers)
 
     def forward(self, x):
-        out = x + self.conv_block(x)
-        return out
+        """
+        CSCA增强的前向传播
+
+        流程：
+        1. 第一个卷积块 (Pad -> Conv -> Norm -> ReLU -> Dropout?)
+        2. 中间注意力插入点 (可选)
+        3. 第二个卷积块 (Pad -> Conv -> Norm)
+        4. 最终注意力插入点 (可选)
+        5. 残差连接
+        """
+        residual = x
+
+        # 第一个卷积块
+        out = self.conv1_block(residual)
+
+        # 中间注意力增强
+        if self.training_stage in ['mid_only', 'full']:
+            mid_attention = self.mid_attention(out)
+            out = out + mid_attention
+
+        # 第二个卷积块
+        out = self.conv2_block(out)
+
+        # 最终注意力增强
+        if self.training_stage in ['final_only', 'full']:
+            final_attention = self.final_attention(out)
+            out = out + final_attention
+
+        # 残差连接
+        return x + self.res_scale * out
+
+    def set_training_stage(self, stage):
+        """设置CSCA训练阶段"""
+        self.training_stage = stage
+
+    def get_csca_losses(self):
+        """获取CSCA的L1正则化损失"""
+        total_loss = 0.0
+
+        # 获取中间注意力损失
+        if hasattr(self.mid_attention, 'gate'):
+            total_loss += self.mid_attention.gate.get_l1_loss()
+
+        # 获取最终注意力损失
+        if hasattr(self.final_attention, 'gate'):
+            total_loss += self.final_attention.gate.get_l1_loss()
+
+        # 递归获取子模块的损失
+        for module in [self.mid_attention, self.final_attention]:
+            for submodule in module.modules():
+                if hasattr(submodule, 'get_l1_loss'):
+                    total_loss += submodule.get_l1_loss()
+
+        return total_loss
 
 
 # Defines the Unet generator.
