@@ -65,9 +65,13 @@ class BaseModel():
         pass
 
     # update learning rate (called once every epoch)
-    def update_learning_rate(self):
-        for scheduler in self.schedulers:
-            scheduler.step()
+    def update_learning_rate(self, metric=None):
+        for s in self.schedulers:
+            # 仅对 plateau 传 metric，其它策略保持原样
+            if isinstance(s, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                s.step(0.0 if metric is None else metric)
+            else:
+                s.step()
         lr = self.optimizers[0].param_groups[0]['lr']
         print('learning rate = %.7f' % lr)
 

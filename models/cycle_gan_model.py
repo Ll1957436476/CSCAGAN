@@ -12,6 +12,8 @@ class CycleGANModel(BaseModel):
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
         parser.set_defaults(no_dropout=True)
+        parser.add_argument('--csca_enable_pattern', type=str, default='mid4',
+                            help="CSCA enable pattern: all|none|mid4|indices:1,3,5 (1-based)|mask:011010")
         if is_train:
             parser.add_argument('--lambda_A', type=float, default=10.0, help='weight for cycle loss (A -> B -> A)')
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
@@ -41,6 +43,37 @@ class CycleGANModel(BaseModel):
 
         return parser
 
+    @staticmethod
+    def _parse_csca_enable_pattern(pattern_str, n_blocks):
+        if pattern_str == 'all':
+            return set(range(n_blocks))
+        elif pattern_str == 'none':
+            return set()
+        elif pattern_str == 'mid4':
+            if n_blocks < 4:
+                print(f"Warning: 'mid4' pattern requested for generator with only {n_blocks} blocks. Enabling all blocks.")
+                return set(range(n_blocks))
+            start_idx = (n_blocks - 4) // 2
+            return set(range(start_idx, start_idx + 4))
+        elif pattern_str.startswith('indices:'):
+            indices_str = pattern_str[len('indices:'):]
+            try:
+                # Expect 1-based indices, convert to 0-based
+                parsed_indices = set(int(i.strip()) - 1 for i in indices_str.split(','))
+                # Validate indices are within bounds [0, n_blocks-1]
+                if any(idx < 0 or idx >= n_blocks for idx in parsed_indices):
+                    raise ValueError(f"Indices out of bounds. Expected 1-based indices between 1 and {n_blocks}.")
+                return parsed_indices
+            except ValueError as e:
+                raise ValueError(f"Invalid indices pattern: {pattern_str}. {e}")
+        elif pattern_str.startswith('mask:'):
+            mask_str = pattern_str[len('mask:'):]
+            if len(mask_str) != n_blocks:
+                raise ValueError(f"Mask length ({len(mask_str)}) does not match n_blocks ({n_blocks}).")
+            return set(i for i, char in enumerate(mask_str) if char == '1')
+        else:
+            raise ValueError(f"Unknown CSCA enable pattern: {pattern_str}")
+
     def initialize(self, opt):
         BaseModel.initialize(self, opt)
 
@@ -52,22 +85,22 @@ class CycleGANModel(BaseModel):
         self.csca_config = CSCAConfig()
         
         # General
-        self.csca_config.mid_init_gate = opt.csca_mid_init_gate
-        self.csca_config.final_init_gate = opt.csca_final_init_gate
-        self.csca_config.reduction = opt.csca_reduction
-        self.csca_config.l1_weight = opt.csca_l1_weight
+        self.csca_config.mid_init_gate = getattr(opt, 'csca_mid_init_gate', 0.05)
+        self.csca_config.final_init_gate = getattr(opt, 'csca_final_init_gate', 0.1)
+        self.csca_config.reduction = getattr(opt, 'csca_reduction', 4)
+        self.csca_config.l1_weight = getattr(opt, 'csca_l1_weight', 1e-4)
         
         # CoT Branch
-        self.csca_config.cot_k = opt.csca_cot_k
-        self.csca_config.cot_heads = opt.csca_cot_heads
-        self.csca_config.cot_temperature = opt.csca_cot_temp
-        self.csca_config.cot_lambda = opt.csca_cot_lambda
+        self.csca_config.cot_k = getattr(opt, 'csca_cot_k', 3)
+        self.csca_config.cot_heads = getattr(opt, 'csca_cot_heads', 4)
+        self.csca_config.cot_temperature = getattr(opt, 'csca_cot_temp', 0.8)
+        self.csca_config.cot_lambda = getattr(opt, 'csca_cot_lambda', 0.7)
         
         # Coord2H Branch
-        self.csca_config.coord_heads = opt.coord_heads
-        self.csca_config.coord_use_softmax = opt.coord_use_softmax
-        self.csca_config.coord_tau = opt.coord_tau
-        self.csca_config.coord_kappa = opt.coord_kappa
+        self.csca_config.coord_heads = getattr(opt, 'coord_heads', 4)
+        self.csca_config.coord_use_softmax = getattr(opt, 'coord_use_softmax', True)
+        self.csca_config.coord_tau = getattr(opt, 'coord_tau', 1.0)
+        self.csca_config.coord_kappa = getattr(opt, 'coord_kappa', 1.0)
 
         self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'csca_reg']
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
@@ -90,12 +123,46 @@ class CycleGANModel(BaseModel):
                                         not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids,
                                         csca_config=self.csca_config, training_stage=self.csca_training_stage)
 
+        # Handle DataParallel wrapper
+        netG_A_module = self.netG_A.module if hasattr(self.netG_A, 'module') else self.netG_A
+        netG_B_module = self.netG_B.module if hasattr(self.netG_B, 'module') else self.netG_B
+
+        # Get actual n_blocks from the generator module
+        n_blocks_actual = getattr(netG_A_module, 'n_blocks', None)
+        
+        # Only apply CSCA mask if generator has n_blocks (i.e., it's a ResNet-based generator)
+        if n_blocks_actual is not None:
+            # Parse CSCA enable pattern and apply mask to generators
+            csca_enabled_indices = self._parse_csca_enable_pattern(opt.csca_enable_pattern, n_blocks_actual)
+            
+            if hasattr(netG_A_module, 'set_csca_mask'):
+                netG_A_module.set_csca_mask(csca_enabled_indices)
+            if hasattr(netG_B_module, 'set_csca_mask'):
+                netG_B_module.set_csca_mask(csca_enabled_indices)
+
+            # Log CSCA configuration for verification
+            print(f"")
+            print(f"--- CSCA Configuration Summary ---")
+            print(f"Total ResNet blocks (n_blocks): {n_blocks_actual}")
+            print(f"CLI CSCA enable pattern: '{opt.csca_enable_pattern}'")
+            print(f"CSCA enabled blocks (0-based): {sorted(list(csca_enabled_indices))}")
+            print(f"CSCA enabled blocks (1-based): {[idx + 1 for idx in sorted(list(csca_enabled_indices))]}")
+            print(f"----------------------------------")
+            print(f"")
+        else:
+            print(f"")
+            print(f"--- CSCA Configuration Summary ---")
+            print(f"Generator type '{opt.netG}' does not support CSCA block selection (no 'n_blocks' attribute).")
+            print(f"CSCA mask application skipped.")
+            print(f"----------------------------------")
+            print(f"")
+
         if self.isTrain:
-            self.is_sn_gan = opt.sn_gan
-            self.is_wgan = opt.wgan
-            self.with_gp = opt.with_gp
-            self.lambda_gp = opt.lambda_gp
-            use_sigmoid = opt.no_lsgan
+            self.is_sn_gan = getattr(opt, 'sn_gan', 1)
+            self.is_wgan = getattr(opt, 'wgan', 0)
+            self.with_gp = getattr(opt, 'with_gp', 0)
+            self.lambda_gp = getattr(opt, 'lambda_gp', 10)
+            use_sigmoid = getattr(opt, 'no_lsgan', False) and not self.is_wgan
             if self.is_sn_gan:
                 self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, "spectral", use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
                 self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD, opt.n_layers_D, "spectral", use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
