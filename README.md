@@ -4,7 +4,8 @@ This project is a PyTorch implementation of CycleGAN for unpaired image-to-image
 
 ## Key Features
 
--   **Spectral Normalization (SN)**: The discriminators are enhanced with Spectral Normalization for more stable training dynamics.
+-   **Spectral Normalization (SN)**: The discriminators are enhanced with Spectral Normalization for more stable training dynamics. **By default, SN is enabled (`--sn_gan 1`).**
+-   **Wasserstein GAN (WGAN)**: Supports Wasserstein GAN loss. **By default, WGAN is disabled (`--wgan 0`).**
 -   **Cross-Scale Correspondence Attention (CSCA)**: A novel attention module designed to build better correspondence between input and output images, improving translation quality.
 -   **Flexible Framework**: Easily train and test on new datasets.
 -   **Visdom Integration**: Monitor training progress, including images and loss plots, through Visdom.
@@ -45,9 +46,24 @@ Training scripts are highly customizable through command-line arguments. Here is
 python train.py --dataroot ./datasets/horse2zebra --name horse2zebra_csca_model --model cycle_gan --display_id 1
 ```
 
+A key feature is the ability to control which ResNet blocks have the CSCA attention module enabled, using the `--csca_enable_pattern` flag.
+
+**Examples of using `--csca_enable_pattern`:**
+```bash
+# Default behavior (same as not specifying the flag), enables the middle 4 blocks
+python train.py --dataroot ./datasets/horse2zebra --name horse2zebra_csca_mid4 --csca_enable_pattern mid4
+
+# Enable CSCA on all blocks
+python train.py --dataroot ./datasets/horse2zebra --name horse2zebra_csca_all --csca_enable_pattern all
+
+# Enable CSCA on specific blocks (e.g., 1st, 5th, and 9th)
+python train.py --dataroot ./datasets/horse2zebra --name horse2zebra_csca_sparse --csca_enable_pattern indices:1,5,9
+```
+
 -   `--dataroot`: Path to your dataset.
 -   `--name`: Name for the experiment. Checkpoints and logs will be saved to `./checkpoints/[name]`.
 -   `--model`: Specifies which model to use (`cycle_gan` in this case).
+-   `--csca_enable_pattern`: Controls CSCA activation. Accepts `all`, `none`, `mid4` (default), `indices:1,5,9` (1-based), or `mask:011110000`.
 -   `--display_id`: Visdom window ID. Set to `0` or a negative number to disable visdom.
 
 ### 3. Testing

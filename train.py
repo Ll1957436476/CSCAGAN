@@ -64,6 +64,13 @@ if __name__ == '__main__':
             model.save_networks('latest')
             model.save_networks(epoch)
 
-        print('End of epoch %d / %d \t Time Taken: %d sec' %
+        # Pass a metric to update_learning_rate for Plateau scheduler
+        # Using total generator loss as the metric
+        losses = model.get_current_losses() # Ensure losses are up-to-date
+        metric_for_lr_scheduler = losses.get('G', None) # Get 'G' loss, default to None if not present
+        if metric_for_lr_scheduler is not None:
+            metric_for_lr_scheduler = float(metric_for_lr_scheduler) # Ensure it's a float
+
+        print('End of epoch %d / %d 	 Time Taken: %d sec' %
               (epoch, opt.niter + opt.niter_decay, time.time() - epoch_start_time))
-        model.update_learning_rate()
+        model.update_learning_rate(metric_for_lr_scheduler)

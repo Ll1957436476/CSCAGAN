@@ -1,6 +1,6 @@
 # Project Status Report
 
-**Date:** 2025年8月9日
+**Date:** 2025年8月11日星期一
 
 ## 1. Overall Summary
 
@@ -40,7 +40,14 @@ The final v4.1 model is the culmination of the following key improvements:
 
 ## 4. Current Status & Next Steps
 
-**Current Status**: The model architecture is now finalized at v4.1. The codebase is feature-complete, robust, and highly configurable via an extensive set of command-line arguments.
+**Current Status**: The model architecture is now finalized at v4.1. The codebase has undergone significant enhancements to improve its **robustness, stability, and usability**. Key updates include:
+
+*   **Selective CSCA Enabling**: The generator now supports granular control over CSCA module activation per ResNet block via the `--csca_enable_pattern` CLI argument. This allows for flexible experimentation and optimization of computational speed.
+*   **Comprehensive Bug Fixes**: Addressed several critical bugs and potential issues across `networks.py` and `cycle_gan_model.py`, including learning rate scheduler behavior, discriminator initialization, and consistent loss calculations.
+*   **Enhanced CLI and Logging**: Improved command-line argument parsing and introduced a detailed startup log for CSCA configuration, providing clear verification of enabled blocks.
+*   **Refined Default Behaviors**: Adjusted default settings for certain GAN components (e.g., `wgan` now defaults to disabled) to align with common research practices while maintaining user configurability.
+
+The codebase is feature-complete, highly configurable, and more resilient.
 
 **CRITICAL: Checkpoint Incompatibility**
 > The numerous architectural changes mean that **all previously saved model checkpoints are now incompatible with the updated code.** A full retraining is mandatory.
@@ -65,6 +72,8 @@ python train.py --dataroot ./datasets/horse2zebra \
                 --coord_tau 1.0 \
                 --coord_kappa 1.0 \
                 --csca_cot_temp 0.8 \
-                --csca_cot_lambda 0.7
+                --csca_cot_lambda 0.7 \
+                --csca_enable_pattern mid4 # New: selectively enable CSCA in middle blocks
 ```
+
 ```

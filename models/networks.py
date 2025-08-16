@@ -15,14 +15,14 @@ def get_norm_layer(norm_type='instance'):
     elif norm_type == 'instance':
         norm_layer = functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
     elif norm_type == 'none':
-        norm_layer = None
+        norm_layer = lambda num_features: nn.Identity()
     else:
         raise NotImplementedError('normalization layer [%s] is not found' % norm_type)
     return norm_layer
 
 
 def get_scheduler(optimizer, opt):
-    if opt.lr_policy == 'lambda':
+    if opt.lr_policy in ('lambda', 'linear'): # Combined lambda and linear
         def lambda_rule(epoch):
             lr_l = 1.0 - max(0, epoch + opt.epoch_count - opt.niter) / float(opt.niter_decay + 1)
             return lr_l
@@ -32,9 +32,10 @@ def get_scheduler(optimizer, opt):
     elif opt.lr_policy == 'plateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, threshold=0.01, patience=5)
     elif opt.lr_policy == 'cosine':
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=opt.niter, eta_min=0)
+        T_total = max(1, getattr(opt, 'niter', 0) + getattr(opt, 'niter_decay', 0)) # Corrected T_max with protection
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_total, eta_min=0)
     else:
-        return NotImplementedError('learning rate policy [%s] is not implemented', opt.lr_policy)
+        raise NotImplementedError(f'learning rate policy [{opt.lr_policy}] is not implemented')
     return scheduler
 
 
@@ -65,7 +66,8 @@ def init_weights(net, init_type='normal', gain=0.02):
 def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     if len(gpu_ids) > 0:
         assert(torch.cuda.is_available())
-        net.to(gpu_ids[0])
+        device = torch.device(f'cuda:{gpu_ids[0]}')
+        net.to(device)
         net = torch.nn.DataParallel(net, gpu_ids)
     init_weights(net, init_type, gain=init_gain)
     return net
@@ -85,14 +87,14 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
 
     if netG == 'resnet_9blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9,
-                             csca_config=csca_config, training_stage=training_stage)
+                             csca_config=csca_config, training_stage=training_stage, norm_type_str=norm)
     elif netG == 'resnet_6blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6,
-                             csca_config=csca_config, training_stage=training_stage)
+                             csca_config=csca_config, training_stage=training_stage, norm_type_str=norm)
     elif netG == 'unet_128':
-        net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+        net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout, norm_type_str=norm)
     elif netG == 'unet_256':
-        net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+        net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout, norm_type_str=norm)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -110,13 +112,13 @@ def define_D(input_nc, ndf, netD,
         norm_layer = get_norm_layer(norm_type=norm)
 
         if netD == 'basic':
-            net = NLayerDiscriminator(input_nc, ndf, n_layers=3, norm_layer=norm_layer, use_sigmoid=use_sigmoid)
+            net = NLayerDiscriminator(input_nc, ndf, n_layers=3, norm_layer=norm_layer, use_sigmoid=use_sigmoid, norm_type_str=norm)
         elif netD == 'n_layers':
-            net = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer, use_sigmoid=use_sigmoid)
+            net = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer, use_sigmoid=use_sigmoid, norm_type_str=norm)
         elif netD == 'pixel':
-            net = PixelDiscriminator(input_nc, ndf, norm_layer=norm_layer, use_sigmoid=use_sigmoid)
+            net = PixelDiscriminator(input_nc, ndf, norm_layer=norm_layer, use_sigmoid=use_sigmoid, norm_type_str=norm)
         else:
-            raise NotImplementedError('Discriminator model name [%s] is not recognized' % net)
+            raise NotImplementedError('Discriminator model name [%s] is not recognized' % netD)
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
@@ -184,7 +186,7 @@ class GradPenalty(nn.Module):
 # https://github.com/jcjohnson/fast-neural-style/
 class ResnetGenerator(nn.Module):
     def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect',
-                 csca_config=None, training_stage='full'):
+                 csca_config=None, training_stage='full', norm_type_str='batch'): # Added norm_type_str
         """
         CSCA增强的ResNet生成器
 
@@ -198,6 +200,7 @@ class ResnetGenerator(nn.Module):
             padding_type: 填充类型
             csca_config: CSCA配置对象
             training_stage: CSCA训练阶段
+            norm_type_str: 归一化类型字符串 (e.g., 'batch', 'instance', 'none')
         """
         assert(n_blocks >= 0)
         super(ResnetGenerator, self).__init__()
@@ -213,10 +216,7 @@ class ResnetGenerator(nn.Module):
             csca_config = CSCAConfig()
         self.csca_config = csca_config
 
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+        use_bias = (norm_type_str == 'instance' or norm_type_str == 'none')
 
         # 构建模型层
         model = [nn.ReflectionPad2d(3),
@@ -238,13 +238,15 @@ class ResnetGenerator(nn.Module):
         mult = 2**n_downsampling
         self.resnet_blocks = nn.ModuleList()
         for i in range(n_blocks):
+            # 默认启用CSCA，后续可通过set_csca_mask关闭
             block = ResnetBlock(ngf * mult,
                               padding_type=padding_type,
                               norm_layer=norm_layer,
                               use_dropout=use_dropout,
                               use_bias=use_bias,
                               csca_config=self.csca_config,
-                              training_stage=training_stage)
+                              training_stage=training_stage,
+                              enable_csca=True)
             self.resnet_blocks.append(block)
             model.append(block)
 
@@ -274,6 +276,23 @@ class ResnetGenerator(nn.Module):
         for block in self.resnet_blocks:
             block.set_training_stage(stage)
 
+    def set_csca_mask(self, csca_enabled_indices=None):
+        """
+        设置哪些ResNet块启用CSCA模块。
+
+        Args:
+            csca_enabled_indices (list or set): 启用CSCA的块的索引列表 (0-based)。
+                                                如果为None，则不进行任何更改。
+        """
+        if csca_enabled_indices is None:
+            return
+        
+        for i, block in enumerate(self.resnet_blocks):
+            if i in csca_enabled_indices:
+                block.enable_csca = True
+            else:
+                block.enable_csca = False
+
     def get_csca_losses(self):
         """获取所有CSCA块的正则化损失"""
         total_loss = 0.0
@@ -285,7 +304,7 @@ class ResnetGenerator(nn.Module):
 # Define a resnet block with integrated CSCA attention
 class ResnetBlock(nn.Module):
     def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias,
-                 csca_config=None, training_stage='full'):
+                 csca_config=None, training_stage='full', enable_csca=True):
         """
         CSCA增强的ResNet块
 
@@ -297,9 +316,11 @@ class ResnetBlock(nn.Module):
             use_bias: 是否使用bias
             csca_config: CSCA配置对象
             training_stage: CSCA训练阶段 ('mid_only', 'final_only', 'full')
+            enable_csca: 是否启用CSCA模块
         """
         super(ResnetBlock, self).__init__()
         self.training_stage = training_stage
+        self.enable_csca = enable_csca
 
         # 导入CSCA模块
         from .CSCA import MidAttentionModule, FinalAttentionModule, CSCAConfig
@@ -330,10 +351,6 @@ class ResnetBlock(nn.Module):
         )
 
         self.res_scale = nn.Parameter(torch.tensor(1.0)) # Bugfix #7: 修正缺失的残差缩放参数
-
-        # 调试信息：确认CSCA模块正常启用 (已注释，需要时可取消注释)
-        # print(f"创建ResNet块，CSCA配置: {csca_config}, 训练阶段: {training_stage}")
-        # print(f"CSCA模块已启用 - 中间注意力: {csca_config.mid_init_gate}, 最终注意力: {csca_config.final_init_gate}")
 
     def build_conv_blocks(self, dim, padding_type, norm_layer, use_dropout, use_bias):
         """
@@ -394,7 +411,7 @@ class ResnetBlock(nn.Module):
         out = self.conv1_block(residual)
 
         # 中间注意力增强
-        if self.training_stage in ['mid_only', 'full']:
+        if self.enable_csca and self.training_stage in ['mid_only', 'full']:
             mid_attention = self.mid_attention(out)
             out = out + mid_attention
 
@@ -402,7 +419,7 @@ class ResnetBlock(nn.Module):
         out = self.conv2_block(out)
 
         # 最终注意力增强
-        if self.training_stage in ['final_only', 'full']:
+        if self.enable_csca and self.training_stage in ['final_only', 'full']:
             final_attention = self.final_attention(out)
             out = out + final_attention
 
@@ -415,23 +432,23 @@ class ResnetBlock(nn.Module):
 
     def get_csca_losses(self):
         """获取CSCA的L1正则化损失"""
-        total_loss = 0.0
+        # 始终返回同设备 Tensor
+        device = next(self.parameters()).device
+        if not self.enable_csca:
+            return torch.zeros((), device=device)
+            
+        total = torch.zeros((), device=device)
+        seen = set()
 
-        # 获取中间注意力损失
-        if hasattr(self.mid_attention, 'gate'):
-            total_loss += self.mid_attention.gate.get_l1_loss()
-
-        # 获取最终注意力损失
-        if hasattr(self.final_attention, 'gate'):
-            total_loss += self.final_attention.gate.get_l1_loss()
-
-        # 递归获取子模块的损失
+        # 递归获取子模块的损失，并使用seen集合去重
         for module in [self.mid_attention, self.final_attention]:
             for submodule in module.modules():
                 if hasattr(submodule, 'get_l1_loss'):
-                    total_loss += submodule.get_l1_loss()
-
-        return total_loss
+                    sid = id(submodule)
+                    if sid not in seen:
+                        seen.add(sid)
+                        total = total + submodule.get_l1_loss()
+        return total
 
 
 # Defines the Unet generator.
@@ -440,17 +457,17 @@ class ResnetBlock(nn.Module):
 # at the bottleneck
 class UnetGenerator(nn.Module):
     def __init__(self, input_nc, output_nc, num_downs, ngf=64,
-                 norm_layer=nn.BatchNorm2d, use_dropout=False):
+                 norm_layer=nn.BatchNorm2d, use_dropout=False, norm_type_str='batch'): # Added norm_type_str
         super(UnetGenerator, self).__init__()
 
         # construct unet structure
-        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True)
+        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True, norm_type_str=norm_type_str)
         for i in range(num_downs - 5):
-            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout)
-        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm_layer=norm_layer)
+            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout, norm_type_str=norm_type_str)
+        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, norm_type_str=norm_type_str)
+        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer, norm_type_str=norm_type_str)
+        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer, norm_type_str=norm_type_str)
+        unet_block = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm_layer=norm_layer, norm_type_str=norm_type_str)
 
         self.model = unet_block
 
@@ -463,13 +480,10 @@ class UnetGenerator(nn.Module):
 #   |-- downsampling -- |submodule| -- upsampling --|
 class UnetSkipConnectionBlock(nn.Module):
     def __init__(self, outer_nc, inner_nc, input_nc=None,
-                 submodule=None, outermost=False, innermost=False, norm_layer=nn.BatchNorm2d, use_dropout=False):
+                 submodule=None, outermost=False, innermost=False, norm_layer=nn.BatchNorm2d, use_dropout=False, norm_type_str='batch'): # Added norm_type_str
         super(UnetSkipConnectionBlock, self).__init__()
         self.outermost = outermost
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+        use_bias = (norm_type_str == 'instance' or norm_type_str == 'none') # Updated use_bias logic
         if input_nc is None:
             input_nc = outer_nc
         downconv = nn.Conv2d(input_nc, inner_nc, kernel_size=4,
@@ -516,12 +530,9 @@ class UnetSkipConnectionBlock(nn.Module):
 
 # Defines the PatchGAN discriminator with the specified arguments.
 class NLayerDiscriminator(nn.Module):
-    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, use_sigmoid=False):
+    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, use_sigmoid=False, norm_type_str='batch'): # Added norm_type_str
         super(NLayerDiscriminator, self).__init__()
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+        use_bias = (norm_type_str == 'instance' or norm_type_str == 'none') # Updated use_bias logic
 
         kw = 4
         padw = 1
@@ -603,12 +614,9 @@ class NLayerDiscriminatorSN(nn.Module):
         return self.model(input)
 
 class PixelDiscriminator(nn.Module):
-    def __init__(self, input_nc, ndf=64, norm_layer=nn.BatchNorm2d, use_sigmoid=False):
+    def __init__(self, input_nc, ndf=64, norm_layer=nn.BatchNorm2d, use_sigmoid=False, norm_type_str='batch'): # Added norm_type_str
         super(PixelDiscriminator, self).__init__()
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+        use_bias = (norm_type_str == 'instance' or norm_type_str == 'none') # Updated use_bias logic
 
         self.net = [
             nn.Conv2d(input_nc, ndf, kernel_size=1, stride=1, padding=0),
